@@ -15,15 +15,15 @@ var PUBSUBCHANNEL = "publish-lock-channel"
 
 var rLockScript = redis.NewScript(`
 -- 若锁不存在，新增锁、设置锁重入次数为1、设置锁过期时间
-if (redis.call('exists', 'KEYS[1]' == 0) then
+if (redis.call('exists', 'KEYS[1]') == 0) then
 	redis.call('hincrby', KEYS[1], ARGV[2], 1);
-	redis.call('hexpire', KEYS[1], ARGV[1]);
+	redis.call('pexpire', KEYS[1], ARGV[1]);
 	return -1;
 end;
--- 若锁存在且锁标识匹配，则表明当前加锁为可重入锁，将锁重入次数+1，并在此设置锁过期时间
+-- 若锁存在且锁标识匹配，则表明当前加锁为可重入锁，将锁重入次数+1，并再次设置锁过期时间
 if (redis.call('hexists', KEYS[1], ARGV[2]) == 1) then
 	redis.call('hincrby', KEYS[1], ARGV[2], 1);
-	redis.call('hexpire', KEYS[1], ARGV[1]);
+	redis.call('pexpire', KEYS[1], ARGV[1]);
 	return -1;
 end; 
 -- 若锁存在但锁标识不匹配，则表明当前锁被占用，直接返回过期时间
@@ -164,7 +164,7 @@ func (l *Rlock) UnLock() error {
 	gid := delayqueue.GetGoroutineID()
 	publishChannel := fmt.Sprintf("%s:%s", PUBSUBCHANNEL, l.Key)
 	lockHashKey := fmt.Sprintf("%s:%d", l.uuid, gid)
-	_, err := rUnlockScript.Run(l.rdb, []string{l.Key, publishChannel}, lockHashKey, WATCHDOGTIMEOUT, PUBLISHMESSAGE).Result()
+	_, err := rUnlockScript.Run(l.rdb, []string{l.Key, publishChannel}, lockHashKey, fmt.Sprintf("%d", WATCHDOGTIMEOUT.Milliseconds()), PUBLISHMESSAGE).Result()
 	if err != nil {
 		return err
 	}
