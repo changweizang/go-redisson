@@ -9,8 +9,9 @@ import (
 	"time"
 )
 
-var WatchDogTimeout = 30 * time.Second
-var PublishMessage = 1
+var WATCHDOGTIMEOUT = 30 * time.Second
+var PUBLISHMESSAGE = 1
+var PUBSUBCHANNEL = "publish-lock-channel"
 
 var rLockScript = redis.NewScript(`
 -- 若锁不存在，新增锁、设置锁重入次数为1、设置锁过期时间
@@ -75,13 +76,62 @@ func (l *Rlock) TryLock(wTime int) error {
 	// 获取锁失败，尝试再次获取
 	waitTime -= time.Now().UnixNano() / 1e6 - current
 	if waitTime <= 0 {
-		return errors.New("get lock failed: time running out")
+		return errors.New("get lock failed: wait time running out")
 	}
 	// 等待消息
 	current = time.Now().UnixNano() / 1e6
-
-	// todo
-	return nil
+	subscribe := l.rdb.Subscribe(fmt.Sprintf("%s:%s", PUBSUBCHANNEL, l.Key))
+	time.AfterFunc(time.Duration(waitTime) * time.Millisecond, func() {
+		// 此时channel也会被关闭
+		_ = subscribe.Close()
+	})
+	_, err = subscribe.ReceiveMessage()
+	if err != nil {
+		// 等待时间到，通道关闭
+		return errors.New("retry lock failed: wait time running out")
+	}
+	waitTime -= time.Now().UnixNano() / 1e6 - current
+	if waitTime <= 0 {
+		return errors.New("retry lock failed: wait time running out")
+	}
+	for {
+		current = time.Now().UnixNano() / 1e6
+		ttl, err = l.tryAcquire(-1)
+		if err != nil {
+			return err
+		}
+		if ttl < 0 {
+			return nil
+		}
+		waitTime -= time.Now().UnixNano() / 1e6 - current
+		if waitTime <= 0 {
+			return errors.New("retry lock failed: wait time running out")
+		}
+		current = time.Now().UnixNano() / 1e6
+		if ttl < waitTime {
+			time.AfterFunc(time.Duration(ttl) * time.Millisecond, func() {
+				_ = subscribe.Close()
+			})
+			_, err = subscribe.ReceiveMessage()
+			if err != nil {
+				// 等待时间到，通道关闭
+				return errors.New("retry lock failed: wait time running out")
+			}
+		} else {
+			time.AfterFunc(time.Duration(waitTime) * time.Millisecond, func() {
+				_ = subscribe.Close()
+			})
+			_, err = subscribe.ReceiveMessage()
+			if err != nil {
+				// 等待时间到，通道关闭
+				return errors.New("retry lock failed: wait time running out")
+			}
+		}
+		waitTime -= time.Now().UnixNano() / 1e6 - current
+		if waitTime <= 0 {
+			return errors.New("retry lock failed: wait time running out")
+		}
+	}
 }
 
 func (l *Rlock) tryAcquire(leaseTime int64) (int64, error) {
@@ -89,7 +139,7 @@ func (l *Rlock) tryAcquire(leaseTime int64) (int64, error) {
 		return l.tryAcquireInner(leaseTime)
 	}
 	// 默认使用看门狗的过期时间
-	ttl, err := l.tryAcquireInner(WatchDogTimeout.Milliseconds())
+	ttl, err := l.tryAcquireInner(WATCHDOGTIMEOUT.Milliseconds())
 	if err != nil {
 		return 0, err
 	}
@@ -112,9 +162,9 @@ func (l *Rlock) tryAcquireInner(leaseTime int64) (int64, error) {
 
 func (l *Rlock) UnLock() error {
 	gid := delayqueue.GetGoroutineID()
-	publishChannel := fmt.Sprintf("publish-lock-channel:%s", l.Key)
+	publishChannel := fmt.Sprintf("%s:%s", PUBSUBCHANNEL, l.Key)
 	lockHashKey := fmt.Sprintf("%s:%d", l.uuid, gid)
-	_, err := rUnlockScript.Run(l.rdb, []string{l.Key, publishChannel}, lockHashKey, WatchDogTimeout, PublishMessage).Result()
+	_, err := rUnlockScript.Run(l.rdb, []string{l.Key, publishChannel}, lockHashKey, WATCHDOGTIMEOUT, PUBLISHMESSAGE).Result()
 	if err != nil {
 		return err
 	}
