@@ -7,7 +7,7 @@ import (
 
 func TestTryLock(t *testing.T) {
 	rdb := redis.NewClient(&redis.Options{
-		Addr: "106.15.199.75:6379",
+		Addr: "localhost:6379",
 		Password: "123456",
 	})
 	lock := InitRLock("testKey", rdb)

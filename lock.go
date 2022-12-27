@@ -6,6 +6,7 @@ import (
 	"gitee.com/zhouxiaozhu/go-delayqueue"
 	"github.com/go-redis/redis"
 	"github.com/google/uuid"
+	conmap "github.com/orcaman/concurrent-map"
 	"time"
 )
 
@@ -48,17 +49,28 @@ end;
 return 0;
 `)
 
+var renewExpireScript = redis.NewScript(`
+-- 对当前锁续约
+if (redis.call('hexists', KEYS[1], ARGV[2]) == 1) then
+    redis.call('pexpire', KEYS[1], ARGV[1]);
+    return 1;
+end ;
+return 0
+`)
+
 type Rlock struct {
-	Key string
-	rdb *redis.Client
-	uuid string
+	Key        string
+	rdb        *redis.Client
+	uuid       string
+	renewalMap conmap.ConcurrentMap
 }
 
 func InitRLock(key string, client *redis.Client) *Rlock {
 	return &Rlock{
-		Key: key,
-		rdb: client,
-		uuid: uuid.New().String(),
+		Key:        key,
+		rdb:        client,
+		uuid:       uuid.New().String(),
+		renewalMap: conmap.New(),
 	}
 }
 
@@ -74,14 +86,14 @@ func (l *Rlock) TryLock(wTime int) error {
 		return nil
 	}
 	// 获取锁失败，尝试再次获取
-	waitTime -= time.Now().UnixNano() / 1e6 - current
+	waitTime -= time.Now().UnixNano()/1e6 - current
 	if waitTime <= 0 {
 		return errors.New("get lock failed: wait time running out")
 	}
 	// 等待消息
 	current = time.Now().UnixNano() / 1e6
 	subscribe := l.rdb.Subscribe(fmt.Sprintf("%s:%s", PUBSUBCHANNEL, l.Key))
-	time.AfterFunc(time.Duration(waitTime) * time.Millisecond, func() {
+	time.AfterFunc(time.Duration(waitTime)*time.Millisecond, func() {
 		// 此时channel也会被关闭
 		_ = subscribe.Close()
 	})
@@ -90,7 +102,7 @@ func (l *Rlock) TryLock(wTime int) error {
 		// 等待时间到，通道关闭
 		return errors.New("retry lock failed: wait time running out")
 	}
-	waitTime -= time.Now().UnixNano() / 1e6 - current
+	waitTime -= time.Now().UnixNano()/1e6 - current
 	if waitTime <= 0 {
 		return errors.New("retry lock failed: wait time running out")
 	}
@@ -103,13 +115,13 @@ func (l *Rlock) TryLock(wTime int) error {
 		if ttl < 0 {
 			return nil
 		}
-		waitTime -= time.Now().UnixNano() / 1e6 - current
+		waitTime -= time.Now().UnixNano()/1e6 - current
 		if waitTime <= 0 {
 			return errors.New("retry lock failed: wait time running out")
 		}
 		current = time.Now().UnixNano() / 1e6
 		if ttl < waitTime {
-			time.AfterFunc(time.Duration(ttl) * time.Millisecond, func() {
+			time.AfterFunc(time.Duration(ttl)*time.Millisecond, func() {
 				_ = subscribe.Close()
 			})
 			_, err = subscribe.ReceiveMessage()
@@ -118,7 +130,7 @@ func (l *Rlock) TryLock(wTime int) error {
 				return errors.New("retry lock failed: wait time running out")
 			}
 		} else {
-			time.AfterFunc(time.Duration(waitTime) * time.Millisecond, func() {
+			time.AfterFunc(time.Duration(waitTime)*time.Millisecond, func() {
 				_ = subscribe.Close()
 			})
 			_, err = subscribe.ReceiveMessage()
@@ -127,7 +139,7 @@ func (l *Rlock) TryLock(wTime int) error {
 				return errors.New("retry lock failed: wait time running out")
 			}
 		}
-		waitTime -= time.Now().UnixNano() / 1e6 - current
+		waitTime -= time.Now().UnixNano()/1e6 - current
 		if waitTime <= 0 {
 			return errors.New("retry lock failed: wait time running out")
 		}
@@ -139,13 +151,14 @@ func (l *Rlock) tryAcquire(leaseTime int64) (int64, error) {
 		return l.tryAcquireInner(leaseTime)
 	}
 	// 默认使用看门狗的过期时间
+	gid := delayqueue.GetGoroutineID()
 	ttl, err := l.tryAcquireInner(WATCHDOGTIMEOUT.Milliseconds())
 	if err != nil {
 		return 0, err
 	}
 	if ttl < 0 {
 		// 获取锁成功， 对锁的有效期进行续约
-
+		l.scheduleExpirationRenewal(gid)
 	}
 	return ttl, nil
 }
@@ -160,8 +173,64 @@ func (l *Rlock) tryAcquireInner(leaseTime int64) (int64, error) {
 	return result.(int64), nil
 }
 
+func (l *Rlock) scheduleExpirationRenewal(goroutineId uint64) {
+	entry := NewEntry()
+	entryName := l.getEntryName(l.Key)
+	if oldEntry, ok := l.renewalMap.Get(entryName); ok {
+		oldEntry.(*Entry).addGoroutineId(goroutineId)
+	} else {
+		entry.addGoroutineId(goroutineId)
+		go l.renewExpiration(goroutineId)
+		l.renewalMap.Set(entryName, entry)
+	}
+}
+
+func (l *Rlock) renewExpiration(goroutineId uint64) {
+	entryName := l.getEntryName(l.Key)
+	ticker := time.NewTicker(WATCHDOGTIMEOUT / 3)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			_, err := l.renewExpirationAsync(goroutineId)
+			if err != nil {
+				l.renewalMap.Remove(entryName)
+				return
+			}
+		}
+	}
+
+}
+
+func (l *Rlock) renewExpirationAsync(goroutineId uint64) (int64, error) {
+	lockHashKey := fmt.Sprintf("%s:%d", l.uuid, goroutineId)
+	result, err := renewExpireScript.Run(l.rdb, []string{l.Key}, WATCHDOGTIMEOUT, lockHashKey).Result()
+	if err != nil {
+		return 0, err
+	}
+	return result.(int64), nil
+}
+
+func (l *Rlock) cancelExpirationRenewal(goroutineId uint64) {
+	entryName := l.getEntryName(l.Key)
+	entry, ok := l.renewalMap.Get(entryName)
+	if !ok {
+		return
+	}
+	task := entry.(*Entry)
+	if goroutineId != 0 {
+		task.removeGoroutineId(goroutineId)
+	}
+	if goroutineId == 0 || task.hasNoGoroutine() {
+		l.renewalMap.Remove(entryName)
+	}
+}
+
 func (l *Rlock) UnLock() error {
 	gid := delayqueue.GetGoroutineID()
+	defer func() {
+		l.cancelExpirationRenewal(gid)
+	}()
 	publishChannel := fmt.Sprintf("%s:%s", PUBSUBCHANNEL, l.Key)
 	lockHashKey := fmt.Sprintf("%s:%d", l.uuid, gid)
 	_, err := rUnlockScript.Run(l.rdb, []string{l.Key, publishChannel}, lockHashKey, fmt.Sprintf("%d", WATCHDOGTIMEOUT.Milliseconds()), PUBLISHMESSAGE).Result()
@@ -171,17 +240,6 @@ func (l *Rlock) UnLock() error {
 	return nil
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+func (l *Rlock) getEntryName(key string) string {
+	return fmt.Sprintf("%s:%s", l.uuid, key)
+}
