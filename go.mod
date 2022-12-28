@@ -1,4 +1,4 @@
-module github.com/Tracy-4869/go-redisson
+module github.com/changweizang/go-redisson
 
 go 1.17
 
