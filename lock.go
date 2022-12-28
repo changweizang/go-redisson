@@ -16,7 +16,7 @@ var PUBSUBCHANNEL = "publish-lock-channel"
 
 var rLockScript = redis.NewScript(`
 -- 若锁不存在，新增锁、设置锁重入次数为1、设置锁过期时间
-if (redis.call('exists', 'KEYS[1]') == 0) then
+if (redis.call('exists', KEYS[1]) == 0) then
 	redis.call('hincrby', KEYS[1], ARGV[2], 1);
 	redis.call('pexpire', KEYS[1], ARGV[1]);
 	return -1;
@@ -58,19 +58,29 @@ end ;
 return 0
 `)
 
-type Rlock struct {
-	Key        string
+type Common struct {
 	rdb        *redis.Client
 	uuid       string
 	renewalMap conmap.ConcurrentMap
 }
 
-func InitRLock(key string, client *redis.Client) *Rlock {
-	return &Rlock{
-		Key:        key,
+type Rlock struct {
+	Key string
+	c   *Common
+}
+
+func InitRlock(client *redis.Client) *Common {
+	return &Common{
 		rdb:        client,
 		uuid:       uuid.New().String(),
 		renewalMap: conmap.New(),
+	}
+}
+
+func (c *Common) GetLock(key string) *Rlock {
+	return &Rlock{
+		Key: key,
+		c:   c,
 	}
 }
 
@@ -92,7 +102,7 @@ func (l *Rlock) TryLock(wTime int) error {
 	}
 	// 等待消息
 	current = time.Now().UnixNano() / 1e6
-	subscribe := l.rdb.Subscribe(fmt.Sprintf("%s:%s", PUBSUBCHANNEL, l.Key))
+	subscribe := l.c.rdb.Subscribe(fmt.Sprintf("%s:%s", PUBSUBCHANNEL, l.Key))
 	time.AfterFunc(time.Duration(waitTime)*time.Millisecond, func() {
 		// 此时channel也会被关闭
 		_ = subscribe.Close()
@@ -165,8 +175,8 @@ func (l *Rlock) tryAcquire(leaseTime int64) (int64, error) {
 
 func (l *Rlock) tryAcquireInner(leaseTime int64) (int64, error) {
 	gid := delayqueue.GetGoroutineID()
-	lockHashKey := fmt.Sprintf("%s:%d", l.uuid, gid)
-	result, err := rLockScript.Run(l.rdb, []string{l.Key}, leaseTime, lockHashKey).Result()
+	lockHashKey := fmt.Sprintf("%s:%d", l.c.uuid, gid)
+	result, err := rLockScript.Run(l.c.rdb, []string{l.Key}, leaseTime, lockHashKey).Result()
 	if err != nil {
 		return 0, err
 	}
@@ -176,12 +186,12 @@ func (l *Rlock) tryAcquireInner(leaseTime int64) (int64, error) {
 func (l *Rlock) scheduleExpirationRenewal(goroutineId uint64) {
 	entry := NewEntry()
 	entryName := l.getEntryName(l.Key)
-	if oldEntry, ok := l.renewalMap.Get(entryName); ok {
+	if oldEntry, ok := l.c.renewalMap.Get(entryName); ok {
 		oldEntry.(*Entry).addGoroutineId(goroutineId)
 	} else {
 		entry.addGoroutineId(goroutineId)
 		go l.renewExpiration(goroutineId)
-		l.renewalMap.Set(entryName, entry)
+		l.c.renewalMap.Set(entryName, entry)
 	}
 }
 
@@ -194,7 +204,7 @@ func (l *Rlock) renewExpiration(goroutineId uint64) {
 		case <-ticker.C:
 			_, err := l.renewExpirationAsync(goroutineId)
 			if err != nil {
-				l.renewalMap.Remove(entryName)
+				l.c.renewalMap.Remove(entryName)
 				return
 			}
 		}
@@ -203,8 +213,8 @@ func (l *Rlock) renewExpiration(goroutineId uint64) {
 }
 
 func (l *Rlock) renewExpirationAsync(goroutineId uint64) (int64, error) {
-	lockHashKey := fmt.Sprintf("%s:%d", l.uuid, goroutineId)
-	result, err := renewExpireScript.Run(l.rdb, []string{l.Key}, WATCHDOGTIMEOUT, lockHashKey).Result()
+	lockHashKey := fmt.Sprintf("%s:%d", l.c.uuid, goroutineId)
+	result, err := renewExpireScript.Run(l.c.rdb, []string{l.Key}, WATCHDOGTIMEOUT.Milliseconds(), lockHashKey).Result()
 	if err != nil {
 		return 0, err
 	}
@@ -213,7 +223,7 @@ func (l *Rlock) renewExpirationAsync(goroutineId uint64) (int64, error) {
 
 func (l *Rlock) cancelExpirationRenewal(goroutineId uint64) {
 	entryName := l.getEntryName(l.Key)
-	entry, ok := l.renewalMap.Get(entryName)
+	entry, ok := l.c.renewalMap.Get(entryName)
 	if !ok {
 		return
 	}
@@ -222,7 +232,7 @@ func (l *Rlock) cancelExpirationRenewal(goroutineId uint64) {
 		task.removeGoroutineId(goroutineId)
 	}
 	if goroutineId == 0 || task.hasNoGoroutine() {
-		l.renewalMap.Remove(entryName)
+		l.c.renewalMap.Remove(entryName)
 	}
 }
 
@@ -232,8 +242,8 @@ func (l *Rlock) UnLock() error {
 		l.cancelExpirationRenewal(gid)
 	}()
 	publishChannel := fmt.Sprintf("%s:%s", PUBSUBCHANNEL, l.Key)
-	lockHashKey := fmt.Sprintf("%s:%d", l.uuid, gid)
-	_, err := rUnlockScript.Run(l.rdb, []string{l.Key, publishChannel}, lockHashKey, fmt.Sprintf("%d", WATCHDOGTIMEOUT.Milliseconds()), PUBLISHMESSAGE).Result()
+	lockHashKey := fmt.Sprintf("%s:%d", l.c.uuid, gid)
+	_, err := rUnlockScript.Run(l.c.rdb, []string{l.Key, publishChannel}, lockHashKey, fmt.Sprintf("%d", WATCHDOGTIMEOUT.Milliseconds()), PUBLISHMESSAGE).Result()
 	if err != nil {
 		return err
 	}
@@ -241,5 +251,5 @@ func (l *Rlock) UnLock() error {
 }
 
 func (l *Rlock) getEntryName(key string) string {
-	return fmt.Sprintf("%s:%s", l.uuid, key)
+	return fmt.Sprintf("%s:%s", l.c.uuid, key)
 }
